@@ -14,6 +14,7 @@ type SectionKey =
   | 'overview'
   | 'spot'
   | 'frequency'
+  | 'peakshaving'
   | 'capacity'
   | 'lease'
   | 'retirement'
@@ -90,9 +91,19 @@ export default function ShandongStorageCalculator() {
     loanTerm: 12,          // 贷款期限 (年)
     residualValue: 0.05,   // 残值率
 
-    // 功率分配（现货 vs 调频）
+    // 功率分配（现货 vs 调频 vs 调峰）
     spotRatio: 0.7,        // 参与现货比例（0~1）
     frRatio: 0.3,          // 参与调频比例（0~1）
+    peakRatio: 0.0,        // 参与调峰比例（0~1）
+
+    // 收益 - 调峰（江苏：迎峰期 1/6/7/12 月，享受顶峰补贴与 0 充电电费）
+    pkCyclesSummer: 1.4,             // 迎峰期日均周转次数（1、6、7、12 月）
+    pkCyclesNonSummer: 1.5,          // 非迎峰期日均周转次数
+    pkPriceDischargeSummer: 0.391,   // 迎峰期放电电价 元/kWh
+    pkPriceDischargeNonSummer: 0.391,// 非迎峰期放电电价 元/kWh
+    pkPriceSubsidySummer: 0.3,       // 迎峰期顶峰补贴 元/kWh
+    pkPriceChargeNonSummer: 0.2346,  // 非迎峰期充电电价 元/kWh
+    pkMonthlyChargeOverrides: {} as Record<number, number>, // 按月覆盖充电电价
 
     // 收益 - 现货套利
     cyclesPerDay: 2,       // 次/天
@@ -155,6 +166,52 @@ export default function ShandongStorageCalculator() {
       useActualMonthDays: true,
     });
   }, [params.lifeSpan, params.capacityMWh, params.efficiency, params.dodDepth, params.cyclesPerDay, params.runDays, params.firstYearDeg, params.degradation, params.replaceThreshold, params.enableReplacement]);
+
+  // --- 2.5 调峰按月分解（江苏迎峰期模型，与基础数据 / 调峰比例 联动） ---
+  const peakshavingMonthly = useMemo(() => {
+    const MONTHS = [
+      { month: 1, days: 31 }, { month: 2, days: 28 }, { month: 3, days: 31 },
+      { month: 4, days: 30 }, { month: 5, days: 31 }, { month: 6, days: 30 },
+      { month: 7, days: 31 }, { month: 8, days: 31 }, { month: 9, days: 30 },
+      { month: 10, days: 31 }, { month: 11, days: 30 }, { month: 12, days: 31 },
+    ];
+    const isPk = (m: number) => m === 1 || m === 6 || m === 7 || m === 12;
+    // 调峰参与的额定容量(MWh) = 装机容量 × 调峰比例 × DOD
+    const ratedEnergyMWh = params.capacityMWh * params.peakRatio * params.dodDepth;
+    return MONTHS.map(m => {
+      const isPeak = isPk(m.month);
+      const cycles = isPeak ? params.pkCyclesSummer : params.pkCyclesNonSummer;
+      const dischargeDailyMWh = ratedEnergyMWh * cycles;
+      const chargeDailyMWh = params.efficiency > 0 ? dischargeDailyMWh / params.efficiency : 0;
+      const dischargeMWh = dischargeDailyMWh * m.days;
+      const chargeMWh = chargeDailyMWh * m.days;
+      const dischargePrice = isPeak ? params.pkPriceDischargeSummer : params.pkPriceDischargeNonSummer;
+      const subsidy = isPeak ? params.pkPriceSubsidySummer : 0;
+      const defaultChargePrice = isPeak ? 0 : params.pkPriceChargeNonSummer;
+      const chargePrice = params.pkMonthlyChargeOverrides[m.month] ?? defaultChargePrice;
+      const incomeDischarge = dischargeMWh * 1000 * dischargePrice;
+      const incomeSubsidy = dischargeMWh * 1000 * subsidy;
+      const costCharge = chargeMWh * 1000 * chargePrice;
+      const profit = incomeDischarge + incomeSubsidy - costCharge;
+      return {
+        month: m.month, days: m.days, isSummer: isPeak,
+        dischargeMWh, chargeMWh,
+        incomeDischarge, incomeSubsidy, costCharge, profit, chargePrice,
+      };
+    });
+  }, [
+    params.capacityMWh, params.peakRatio, params.dodDepth, params.efficiency,
+    params.pkCyclesSummer, params.pkCyclesNonSummer,
+    params.pkPriceDischargeSummer, params.pkPriceDischargeNonSummer,
+    params.pkPriceSubsidySummer, params.pkPriceChargeNonSummer,
+    params.pkMonthlyChargeOverrides,
+  ]);
+
+  // 调峰基准年净收益（万元，未含 SOH 衰减）
+  const peakshavingAnnualWan = useMemo(
+    () => peakshavingMonthly.reduce((s, r) => s + r.profit, 0) / 10000,
+    [peakshavingMonthly]
+  );
 
   // --- 3. 实时核心测算逻辑 ---
 
@@ -224,7 +281,10 @@ export default function ShandongStorageCalculator() {
       const frAnnualBaseWan = ((frHourlyCapacityYuan + frHourlyMileageYuan) * params.frAnnualHours) / 10000;
       const auxIncome = frAnnualBaseWan * degradFactor; // 随容量衰减折算
 
-      const totalRevenue = spotIncome + compIncome + leaseIncome + auxIncome;
+      // (5) 调峰收益（江苏：迎峰期 1/6/7/12 月，按月分解后年化，随 SOH 衰减折算）
+      const peakIncome = peakshavingAnnualWan * degradFactor;
+
+      const totalRevenue = spotIncome + compIncome + leaseIncome + auxIncome + peakIncome;
 
       // 3. 成本测算 (万元)
       const opex = (totalInvestment / 10000) * params.opexRate;
@@ -292,7 +352,8 @@ export default function ShandongStorageCalculator() {
           spot: spotIncome,
           comp: compIncome,
           lease: leaseIncome,
-          aux: auxIncome
+          aux: auxIncome,
+          peak: peakIncome
         }
       });
     }
@@ -333,7 +394,7 @@ export default function ShandongStorageCalculator() {
       avgRevenue: yearlyData.reduce((a, b) => a + b.revenue, 0) / params.lifeSpan,
       avgNetProfit: yearlyData.reduce((a, b) => a + b.netProfit, 0) / params.lifeSpan
     };
-  }, [params, lifeCycleSim]);
+  }, [params, lifeCycleSim, peakshavingAnnualWan]);
 
   /**
    * 计算基准年放电量（不考虑衰减，用于现货收入展示）
@@ -676,6 +737,7 @@ export default function ShandongStorageCalculator() {
         ['融资', '贷款期限', params.loanTerm, '年'],
         ['功率分配', '参与现货比例', params.spotRatio, ''],
         ['功率分配', '参与调频比例', params.frRatio, ''],
+        ['功率分配', '参与调峰比例', params.peakRatio, ''],
         ['现货', '日循环次数', params.cyclesPerDay, '次/天'],
         ['现货', '净价差', params.spotSpread, '元/kWh'],
         ['容量电价', '容量补偿标准', params.capPriceKW, '元/(kW·年)'],
@@ -692,6 +754,12 @@ export default function ShandongStorageCalculator() {
         ['调频', 'K2 响应', params.frK2, ''],
         ['调频', 'K3 精度', params.frK3, ''],
         ['调频', '年等效调频小时数', params.frAnnualHours, 'h/年'],
+        ['调峰', '迎峰期日周转次数(1/6/7/12月)', params.pkCyclesSummer, '次/日'],
+        ['调峰', '非迎峰期日周转次数', params.pkCyclesNonSummer, '次/日'],
+        ['调峰', '迎峰期放电电价', params.pkPriceDischargeSummer, '元/kWh'],
+        ['调峰', '非迎峰期放电电价', params.pkPriceDischargeNonSummer, '元/kWh'],
+        ['调峰', '迎峰期顶峰补贴', params.pkPriceSubsidySummer, '元/kWh'],
+        ['调峰', '非迎峰期充电电价', params.pkPriceChargeNonSummer, '元/kWh'],
         ['运营', '运维费率', params.opexRate, '%/CAPEX'],
         ['税务', '增值税率', params.vatRate, ''],
         ['税务', '即征即退比例', params.vatRefundRatio, ''],
@@ -720,10 +788,10 @@ export default function ShandongStorageCalculator() {
       XLSX.utils.book_append_sheet(wb, ws2, '核心指标');
 
       // Sheet 3：年度收益与现金流
-      const yearHead = ['年份','期初SOH','期末SOH','是否更换','现货收益(万元)','容量电价(万元)','容量租赁(万元)','调频收益(万元)','总收入(万元)','成本(万元)','净利润(万元)','项目NCF(万元)','资本金NCF(万元)'];
+      const yearHead = ['年份','期初SOH','期末SOH','是否更换','现货收益(万元)','容量电价(万元)','容量租赁(万元)','调频收益(万元)','调峰收益(万元)','总收入(万元)','成本(万元)','净利润(万元)','项目NCF(万元)','资本金NCF(万元)'];
       const yearRows = results.yearlyData.map(y => [
         y.year, y.sohStart, y.sohEnd, y.replaced ? '是' : '否',
-        y.breakdown.spot, y.breakdown.comp, y.breakdown.lease, y.breakdown.aux,
+        y.breakdown.spot, y.breakdown.comp, y.breakdown.lease, y.breakdown.aux, y.breakdown.peak,
         y.revenue, y.cost, y.netProfit, y.projectNCF, y.equityNCF
       ]);
       const ws3 = XLSX.utils.aoa_to_sheet([yearHead, ...yearRows]);
@@ -803,13 +871,22 @@ export default function ShandongStorageCalculator() {
       description: '容量出租 / 长协收益锁定',
     },
     {
-      label: '辅助服务',
-      shortLabel: '辅助',
+      label: '调频收益',
+      shortLabel: '调频',
       value: results.yearlyData[0]?.breakdown.aux ?? 0,
       color: 'from-orange-500 to-amber-400',
       glow: 'shadow-orange-500/20',
       accent: 'bg-orange-400',
       description: '调频调峰 / AGC性能结算',
+    },
+    {
+      label: '调峰收益',
+      shortLabel: '调峰',
+      value: results.yearlyData[0]?.breakdown.peak ?? 0,
+      color: 'from-rose-500 to-pink-400',
+      glow: 'shadow-rose-500/20',
+      accent: 'bg-rose-400',
+      description: '迎峰期顶峰补贴 / 月度滚动结算',
     },
   ].map(item => ({
     ...item,
@@ -911,6 +988,7 @@ export default function ShandongStorageCalculator() {
               { key: 'overview',  label: '收益总览', icon: LayoutDashboard },
               { key: 'spot',      label: '现货交易', icon: Zap },
               { key: 'frequency', label: '调频收益', icon: Gauge },
+              { key: 'peakshaving', label: '调峰收益', icon: Activity },
               { key: 'capacity',  label: '容量电价', icon: Battery },
               { key: 'lease',     label: '容量租赁', icon: Building2 },
               { key: 'retirement',label: '电池退役', icon: BatteryWarning },
@@ -949,6 +1027,7 @@ export default function ShandongStorageCalculator() {
                     overview: '收益测算总览',
                     spot: '现货交易收益',
                     frequency: '调频(辅助服务)收益',
+                    peakshaving: '调峰收益',
                     capacity: '容量电价补偿',
                     lease: '容量租赁收益',
                     retirement: '电池退役 / 全周期衰减模拟',
@@ -1047,10 +1126,7 @@ export default function ShandongStorageCalculator() {
                   <div className="relative mb-6 flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
                     <div>
                       <p className="text-xs font-semibold uppercase tracking-[0.28em] text-cyan-300/80">Revenue Structure Capsule</p>
-                      <h3 className="mt-2 text-2xl font-bold text-white">收益结构科技舱</h3>
-                      <p className="mt-2 max-w-2xl text-sm text-slate-300">
-                        以首年收益为基准，将现货套利、容量补偿、容量租赁与辅助服务拆解为四条收益流。鼠标悬停卡片可查看收益强度与关键来源。
-                      </p>
+                      <h3 className="mt-2 text-3xl md:text-4xl font-bold text-white tracking-wide">数据实时展示舱 <span className="text-cyan-300">// 首年总收益</span></h3>
                     </div>
                     <div className="inline-flex items-center gap-2 rounded-full border border-cyan-400/20 bg-white/5 px-4 py-2 text-sm text-cyan-100 backdrop-blur-sm">
                       <span className="h-2 w-2 rounded-full bg-cyan-300 shadow-[0_0_12px_rgba(103,232,249,0.9)]"></span>
@@ -1060,7 +1136,19 @@ export default function ShandongStorageCalculator() {
 
                   <div className="relative grid grid-cols-1 gap-8 lg:grid-cols-12 lg:items-stretch">
                     <div className="lg:col-span-6 space-y-5">
-                      <div className="mx-auto grid w-full max-w-[560px] grid-cols-4 gap-3">
+                      <div className="relative mx-auto flex h-[360px] w-full max-w-[560px] items-center justify-center">
+                        <div className="absolute inset-5 rounded-full border border-cyan-300/10"></div>
+                        <div className="absolute inset-10 rounded-full border border-cyan-300/15 border-dashed animate-pulse"></div>
+                        <div className="absolute inset-16 rounded-full border border-violet-300/10"></div>
+                        <div className="absolute h-72 w-[22rem] rounded-[2.5rem] bg-[radial-gradient(circle,_rgba(34,211,238,0.35),_rgba(59,130,246,0.16)_45%,_rgba(15,23,42,0)_72%)] blur-sm"></div>
+                        <div className="relative flex h-60 w-[25rem] flex-col items-center justify-center rounded-[2.25rem] border border-cyan-300/20 bg-slate-950/80 px-8 text-center shadow-[0_0_64px_rgba(34,211,238,0.24)] backdrop-blur-sm">
+                          <span className="text-[11px] uppercase tracking-[0.28em] text-cyan-300/70">Core Revenue</span>
+                          <strong className="mt-4 whitespace-nowrap text-[3.6rem] font-semibold leading-none tracking-tight text-white">{formatNumber(firstYearRevenue)}</strong>
+                          <span className="mt-2 text-sm text-slate-400">万元 / 首年</span>
+                        </div>
+                      </div>
+
+                      <div className="mx-auto grid w-full max-w-[640px] grid-cols-5 gap-2.5">
                         {revenueStructure.map(item => (
                           <div
                             key={item.label}
@@ -1074,51 +1162,6 @@ export default function ShandongStorageCalculator() {
                             </div>
                           </div>
                         ))}
-                      </div>
-
-                      <div className="relative mx-auto flex h-[360px] w-full max-w-[560px] items-center justify-center">
-                        <div className="absolute inset-5 rounded-full border border-cyan-300/10"></div>
-                        <div className="absolute inset-10 rounded-full border border-cyan-300/15 border-dashed animate-pulse"></div>
-                        <div className="absolute inset-16 rounded-full border border-violet-300/10"></div>
-                        <div className="absolute h-72 w-[22rem] rounded-[2.5rem] bg-[radial-gradient(circle,_rgba(34,211,238,0.35),_rgba(59,130,246,0.16)_45%,_rgba(15,23,42,0)_72%)] blur-sm"></div>
-                        <div className="relative flex h-60 w-[25rem] flex-col items-center justify-center rounded-[2.25rem] border border-cyan-300/20 bg-slate-950/80 px-8 text-center shadow-[0_0_64px_rgba(34,211,238,0.24)] backdrop-blur-sm">
-                          <span className="text-[11px] uppercase tracking-[0.28em] text-cyan-300/70">Core Revenue</span>
-                          <strong className="mt-4 whitespace-nowrap text-[3.6rem] font-semibold leading-none tracking-tight text-white">{formatNumber(firstYearRevenue)}</strong>
-                          <span className="mt-2 text-sm text-slate-400">万元 / 首年</span>
-                        </div>
-                      </div>
-
-                      <div className="mx-auto w-full max-w-[560px] rounded-[28px] border border-white/10 bg-slate-950/40 px-6 py-5 backdrop-blur-md shadow-[0_12px_40px_rgba(8,15,30,0.35)]">
-                        <div className="mb-3 flex items-center justify-between">
-                          <p className="text-xs font-semibold uppercase tracking-[0.22em] text-cyan-300/70">Background Params</p>
-                          <span className="text-[11px] text-slate-500">收益驱动口径</span>
-                        </div>
-                        <div className="grid grid-cols-1 gap-x-6 gap-y-4 text-left text-[11px] text-slate-300 md:grid-cols-3">
-                          <div>
-                            <p className="text-slate-500">系统容量</p>
-                            <p className="mt-0.5 font-mono text-cyan-100">{formatNumber(params.capacityMWh)} MWh</p>
-                          </div>
-                          <div>
-                            <p className="text-slate-500">日循环次数</p>
-                            <p className="mt-0.5 font-mono text-cyan-100">{formatNumber(params.cyclesPerDay)} 次/天</p>
-                          </div>
-                          <div>
-                            <p className="text-slate-500">综合效率</p>
-                            <p className="mt-0.5 font-mono text-cyan-100">{(params.efficiency * 100).toFixed(1)}%</p>
-                          </div>
-                          <div>
-                            <p className="text-slate-500">系统时长</p>
-                            <p className="mt-0.5 font-mono text-cyan-100">{formatNumber(params.systemDuration)} h</p>
-                          </div>
-                          <div>
-                            <p className="text-slate-500">现货净价差</p>
-                            <p className="mt-0.5 font-mono text-cyan-100">{params.spotSpread.toFixed(4)} 元/kWh</p>
-                          </div>
-                          <div>
-                            <p className="text-slate-500">DOD 深度</p>
-                            <p className="mt-0.5 font-mono text-cyan-100">{(params.dodDepth * 100).toFixed(1)}%</p>
-                          </div>
-                        </div>
                       </div>
                     </div>
 
@@ -1246,7 +1289,8 @@ export default function ShandongStorageCalculator() {
                         { label: '现货套利', value: results.yearlyData[0].breakdown.spot, color: 'bg-blue-500' },
                         { label: '容量补偿', value: results.yearlyData[0].breakdown.comp, color: 'bg-purple-500' },
                         { label: '容量租赁', value: results.yearlyData[0].breakdown.lease, color: 'bg-green-500' },
-                        { label: '辅助服务', value: results.yearlyData[0].breakdown.aux, color: 'bg-orange-500' },
+                        { label: '调频收益', value: results.yearlyData[0].breakdown.aux, color: 'bg-orange-500' },
+                        { label: '调峰收益', value: results.yearlyData[0].breakdown.peak, color: 'bg-rose-500' },
                       ].map((item, idx) => {
                         const total = results.yearlyData[0].revenue;
                         const percent = total > 0 ? (item.value / total) * 100 : 0;
@@ -1810,6 +1854,321 @@ export default function ShandongStorageCalculator() {
                   </div>
                 </div>
               </div>
+              </div>
+              );
+            })()}
+
+            {/* ==================== 调峰收益（江苏迎峰期模型 · 按月分解） ==================== */}
+            {activeSection === 'peakshaving' && (() => {
+              const peakClearedMW = params.capacityMW * params.peakRatio;
+              const peakRatedMWh = params.capacityMWh * params.peakRatio;
+              const monthlyRows = peakshavingMonthly;
+              const totalProfit = monthlyRows.reduce((s, r) => s + r.profit, 0);
+              const profitSummer = monthlyRows.filter(r => r.isSummer).reduce((s, r) => s + r.profit, 0);
+              const profitNonSummer = monthlyRows.filter(r => !r.isSummer).reduce((s, r) => s + r.profit, 0);
+              const incomeDischargeTotal = monthlyRows.reduce((s, r) => s + r.incomeDischarge, 0);
+              const incomeSubsidyTotal = monthlyRows.reduce((s, r) => s + r.incomeSubsidy, 0);
+              const costChargeTotal = monthlyRows.reduce((s, r) => s + r.costCharge, 0);
+              const dischargeMWhTotal = monthlyRows.reduce((s, r) => s + r.dischargeMWh, 0);
+              const chargeMWhTotal = monthlyRows.reduce((s, r) => s + r.chargeMWh, 0);
+              const firstYearPeak = results.yearlyData[0]?.breakdown.peak ?? 0;
+              const lifetimePeak = results.yearlyData.reduce((a, b) => a + b.breakdown.peak, 0);
+              const toWan = (v: number) => (v / 10000).toFixed(2);
+              const handleMonthChargeChange = (month: number, price: number) => {
+                setParams(p => ({
+                  ...p,
+                  pkMonthlyChargeOverrides: { ...p.pkMonthlyChargeOverrides, [month]: price },
+                }));
+              };
+              const exportPeakCsv = () => {
+                const header = ['month','days','isPeak','dischargeMWh','chargeMWh','incomeDischarge(元)','incomeSubsidy(元)','costCharge(元)','profit(元)','chargePrice(元/kWh)'];
+                const lines = monthlyRows.map(r => [
+                  r.month, r.days, r.isSummer ? 'P' : 'N',
+                  r.dischargeMWh.toFixed(3), r.chargeMWh.toFixed(3),
+                  r.incomeDischarge.toFixed(2), r.incomeSubsidy.toFixed(2),
+                  r.costCharge.toFixed(2), r.profit.toFixed(2), r.chargePrice.toFixed(4),
+                ].join(','));
+                const csv = [header.join(','), ...lines].join('\n');
+                const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url; a.download = '调峰收益_按月分解.csv';
+                a.click(); URL.revokeObjectURL(url);
+              };
+              return (
+              <div className="space-y-5">
+                {/* —— 数据实时展示舱 // 调峰收益 —— */}
+                <section className="relative overflow-hidden rounded-[28px] border border-emerald-400/15 bg-[linear-gradient(135deg,_#03140d_0%,_#062b1f_45%,_#03140d_100%)] p-6 md:p-10 shadow-[0_24px_80px_rgba(5,46,33,0.45)]">
+                  <div className="pointer-events-none absolute inset-0 opacity-60">
+                    <div className="absolute -left-20 top-10 h-64 w-64 rounded-full bg-emerald-400/15 blur-[100px]"></div>
+                    <div className="absolute right-0 bottom-0 h-72 w-72 rounded-full bg-teal-300/10 blur-[120px]"></div>
+                    <div className="absolute inset-0 bg-[linear-gradient(rgba(16,185,129,0.06)_1px,transparent_1px),linear-gradient(90deg,rgba(16,185,129,0.06)_1px,transparent_1px)] bg-[size:48px_48px]"></div>
+                    <div className="absolute inset-x-10 top-24 h-px bg-gradient-to-r from-transparent via-emerald-300/40 to-transparent"></div>
+                  </div>
+                  <div className="relative flex flex-col gap-3 md:flex-row md:items-end md:justify-between mb-8">
+                    <div>
+                      <p className="text-[11px] font-semibold uppercase tracking-[0.32em] text-emerald-300/80">REAL-TIME DATA HUB</p>
+                      <h3 className="mt-2 text-2xl md:text-3xl font-bold text-white tracking-wide">数据实时展示舱 <span className="text-emerald-300">// 调峰收益（江苏 · 迎峰期）</span></h3>
+                      <p className="mt-2 max-w-xl text-sm text-emerald-100/70">基于江苏省独立储能政策（1、6、7、12 月迎峰期享顶峰补贴 + 0 充电电费），按月分解实时演算。</p>
+                    </div>
+                    <div className="inline-flex items-center gap-2 rounded-full border border-emerald-300/30 bg-emerald-400/10 px-4 py-2 text-xs text-emerald-100 backdrop-blur-sm">
+                      <span className="relative flex h-2 w-2">
+                        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-300 opacity-70"></span>
+                        <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-300 shadow-[0_0_12px_rgba(110,231,183,0.9)]"></span>
+                      </span>
+                      LIVE · {new Date().toLocaleTimeString('zh-CN', { hour12: false })}
+                    </div>
+                  </div>
+                  <div className="relative grid grid-cols-2 lg:grid-cols-4 gap-5">
+                    {[
+                      { key: 'pk-cap', label: '参与调峰功率', sub: 'Peak-Shaving Capacity', value: formatNumber(peakClearedMW), unit: 'MW', hint: `装机 ${formatNumber(params.capacityMW)} MW × ${(params.peakRatio*100).toFixed(1)}%` },
+                      { key: 'pk-energy', label: '参与调峰容量', sub: 'Peak-Shaving Energy', value: formatNumber(peakRatedMWh), unit: 'MWh', hint: `装机容量 × 调峰比例` },
+                      { key: 'pk-base', label: '基准年净收益', sub: 'Annual Net Profit', value: toWan(totalProfit), unit: '万元', hint: `迎峰 ${toWan(profitSummer)} / 非迎峰 ${toWan(profitNonSummer)}` },
+                      { key: 'pk-firstyear', label: '首年调峰收益', sub: 'First-Year Revenue', value: formatNumber(firstYearPeak), unit: '万元', hint: `占总收入 ${results.yearlyData[0] && results.yearlyData[0].revenue > 0 ? ((firstYearPeak / results.yearlyData[0].revenue)*100).toFixed(1) : '0.0'}%` },
+                    ].map((it, idx) => (
+                      <div key={it.key} className="group relative overflow-hidden rounded-2xl border border-emerald-300/15 bg-[linear-gradient(160deg,rgba(6,78,59,0.55)_0%,rgba(2,20,14,0.85)_100%)] p-5 backdrop-blur-md transition-all duration-300 hover:-translate-y-1 hover:border-emerald-300/40 hover:shadow-[0_18px_60px_rgba(16,185,129,0.25)]">
+                        <div className="absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-transparent via-emerald-300 to-transparent opacity-70"></div>
+                        <div className="absolute -right-10 -top-10 h-28 w-28 rounded-full bg-emerald-400/10 blur-2xl transition-opacity duration-300 group-hover:opacity-80"></div>
+                        <div className="absolute right-3 top-3 font-mono text-[10px] tracking-widest text-emerald-300/60">0{idx + 1}</div>
+                        <p className="text-[11px] uppercase tracking-[0.22em] text-emerald-300/70">{it.sub}</p>
+                        <p className="mt-1 text-sm font-medium text-emerald-50">{it.label}</p>
+                        <div className="mt-5 flex items-baseline gap-2">
+                          <span className="text-[2.4rem] font-bold leading-none tracking-tight bg-gradient-to-br from-white via-emerald-100 to-emerald-300 bg-clip-text text-transparent">{it.value}</span>
+                          <span className="text-xs text-emerald-200/70">{it.unit}</span>
+                        </div>
+                        <div className="mt-5 flex items-center justify-between text-[11px] text-emerald-200/60">
+                          <span className="font-mono">{it.hint}</span>
+                          <span className="inline-flex items-center gap-1 text-emerald-300">
+                            <span className="h-1 w-1 rounded-full bg-emerald-300 shadow-[0_0_6px_rgba(110,231,183,0.9)]"></span>
+                            ONLINE
+                          </span>
+                        </div>
+                        <div className="mt-4 h-1 rounded-full bg-emerald-900/40 overflow-hidden">
+                          <div className="h-full w-2/3 rounded-full bg-gradient-to-r from-emerald-400 via-teal-300 to-emerald-200 group-hover:w-full transition-all duration-700"></div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="relative mt-6 flex flex-wrap items-center justify-between gap-3 text-[11px] text-emerald-200/50 font-mono">
+                    <span>// SOURCE: peak-shaving-engine v1.0 · 江苏迎峰期模型 · 实时演算</span>
+                    <span>SYS: 调峰功率 {formatNumber(peakClearedMW)} MW · 调峰容量 {formatNumber(peakRatedMWh)} MWh · 全周期累计 {formatNumber(lifetimePeak)} 万元</span>
+                  </div>
+                </section>
+
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
+                  {/* 输入区 */}
+                  <div className="lg:col-span-5 space-y-4">
+                    <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+                      <div className="bg-gray-50 px-4 py-3 border-b border-gray-100 flex items-center gap-2">
+                        <Activity size={16} className="text-rose-600" />
+                        <h3 className="font-semibold text-gray-800">调峰参数（江苏迎峰期模型）</h3>
+                      </div>
+                      <div className="p-4 space-y-3">
+                        {/* 功率分配联动展示 —— 深绿高亮风格 */}
+                        <div className="relative overflow-hidden rounded-xl border-2 border-emerald-400/60 ring-2 ring-emerald-300/30 ring-offset-2 ring-offset-white p-4 shadow-[0_8px_30px_rgba(5,150,105,0.35)] bg-[#0a3d33]">
+                          <div className="pointer-events-none absolute inset-0 opacity-90">
+                            <div className="absolute -left-10 -top-10 h-32 w-32 rounded-full bg-emerald-400/20 blur-3xl animate-pulse"></div>
+                            <div className="absolute -right-12 -bottom-12 h-36 w-36 rounded-full bg-teal-300/15 blur-3xl animate-pulse [animation-delay:1.2s]"></div>
+                          </div>
+                          <div className="pointer-events-none absolute inset-x-0 top-0 h-[3px] bg-gradient-to-r from-transparent via-emerald-400 to-transparent opacity-90"></div>
+                          <div className="relative">
+                            <div className="flex items-center gap-1.5 mb-3">
+                              <span className="relative flex h-2 w-2">
+                                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-70"></span>
+                                <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-400 shadow-[0_0_10px_rgba(16,185,129,0.9)]"></span>
+                              </span>
+                              <span className="uppercase text-[10px] tracking-[0.22em] text-emerald-300/90">LINKED</span>
+                              <span className="text-xs font-bold text-white">功率分配联动</span>
+                            </div>
+                            <div className="grid grid-cols-3 gap-3">
+                              <div className="rounded-md border border-emerald-300/30 bg-emerald-900/40 px-3 py-2">
+                                <p className="text-[11px] text-emerald-200/80">装机功率</p>
+                                <p className="mt-0.5 text-base font-bold text-white font-mono">{formatNumber(params.capacityMW)} <span className="text-xs text-emerald-200/70">MW</span></p>
+                              </div>
+                              <div className="rounded-md border border-emerald-300/30 bg-emerald-900/40 px-3 py-2">
+                                <p className="text-[11px] text-emerald-200/80">调峰比例</p>
+                                <p className="mt-0.5 text-base font-bold text-white font-mono">{(params.peakRatio * 100).toFixed(1)}<span className="text-xs text-emerald-200/70">%</span></p>
+                              </div>
+                              <div className="rounded-md border-2 border-emerald-300/70 bg-emerald-500/15 px-3 py-2 shadow-[0_0_18px_rgba(16,185,129,0.35)]">
+                                <p className="text-[11px] text-emerald-200">参与调峰容量</p>
+                                <p className="mt-0.5 text-base font-extrabold text-white font-mono drop-shadow-[0_0_6px_rgba(110,231,183,0.6)]">{formatNumber(peakClearedMW)} <span className="text-xs text-emerald-100">MW</span></p>
+                              </div>
+                            </div>
+                            <p className="text-[11px] text-emerald-200/80 mt-2">参与调峰容量 = 装机功率 × 调峰比例。如需修改比例，请在「基础数据」中调整。</p>
+                          </div>
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-3">
+                          <InputField label="迎峰期日周转次数" unit="次/日" step={0.1} value={params.pkCyclesSummer} onChange={(v:number)=>setParams({...params, pkCyclesSummer:v})} tooltip="迎峰期（1、6、7、12 月）日均循环次数" />
+                          <InputField label="非迎峰期日周转次数" unit="次/日" step={0.1} value={params.pkCyclesNonSummer} onChange={(v:number)=>setParams({...params, pkCyclesNonSummer:v})} tooltip="非迎峰期日均循环次数" />
+                        </div>
+                        <div className="grid grid-cols-2 gap-3">
+                          <InputField label="迎峰期放电电价" unit="元/kWh" step={0.001} value={params.pkPriceDischargeSummer} onChange={(v:number)=>setParams({...params, pkPriceDischargeSummer:v})} />
+                          <InputField label="非迎峰期放电电价" unit="元/kWh" step={0.001} value={params.pkPriceDischargeNonSummer} onChange={(v:number)=>setParams({...params, pkPriceDischargeNonSummer:v})} />
+                        </div>
+                        <div className="grid grid-cols-2 gap-3">
+                          <InputField label="迎峰期顶峰补贴" unit="元/kWh" step={0.01} value={params.pkPriceSubsidySummer} onChange={(v:number)=>setParams({...params, pkPriceSubsidySummer:v})} tooltip="政策给予的迎峰期顶峰放电补贴" />
+                          <InputField label="非迎峰期充电电价" unit="元/kWh" step={0.001} value={params.pkPriceChargeNonSummer} onChange={(v:number)=>setParams({...params, pkPriceChargeNonSummer:v})} tooltip="迎峰期默认充电电价 = 0；非迎峰期按本电价结算" />
+                        </div>
+
+                        <div className="bg-yellow-50 border border-yellow-100 rounded-md p-3 text-xs text-yellow-900">
+                          说明：迎峰期（1、6、7、12 月）默认享受顶峰补贴且充电电价为 0；其余月份按非迎峰期参数结算。可在下方表格中按月覆盖单月充电电价。
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* 结果区 */}
+                  <div className="lg:col-span-7 space-y-3">
+                    <div className="grid grid-cols-3 gap-3">
+                      <div className="bg-white p-3.5 rounded-xl shadow-sm border border-gray-100">
+                        <p className="text-xs text-gray-500">基准年净收益</p>
+                        <p className="text-xl font-bold text-rose-600 mt-1">{toWan(totalProfit)} <span className="text-sm font-normal text-gray-500">万元</span></p>
+                        <p className="text-xs text-gray-400 mt-1">未含 SOH 衰减折算</p>
+                      </div>
+                      <div className="bg-white p-3.5 rounded-xl shadow-sm border border-gray-100">
+                        <p className="text-xs text-gray-500">首年调峰收益（含衰减）</p>
+                        <p className="text-xl font-bold text-rose-600 mt-1">{formatNumber(firstYearPeak)} <span className="text-sm font-normal text-gray-500">万元</span></p>
+                        <p className="text-xs text-gray-400 mt-1">占总收入 {results.yearlyData[0] && results.yearlyData[0].revenue > 0 ? ((firstYearPeak / results.yearlyData[0].revenue)*100).toFixed(1) : '0.0'}%</p>
+                      </div>
+                      <div className="bg-white p-3.5 rounded-xl shadow-sm border border-gray-100">
+                        <p className="text-xs text-gray-500">全周期调峰累计</p>
+                        <p className="text-xl font-bold text-gray-900 mt-1">{formatNumber(lifetimePeak)} <span className="text-sm font-normal text-gray-500">万元</span></p>
+                        <p className="text-xs text-gray-400 mt-1">{params.lifeSpan} 年合计（含衰减）</p>
+                      </div>
+                    </div>
+
+                    {/* 迎峰期 vs 非迎峰期 概览 */}
+                    <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-100">
+                      <h3 className="text-sm font-bold text-gray-800 mb-3">基准年收益结构（万元）</h3>
+                      <div className="overflow-hidden rounded-lg border border-gray-200">
+                        <table className="min-w-full text-left text-xs text-gray-900">
+                          <thead className="bg-gray-50 text-[11px] uppercase tracking-wide text-gray-500">
+                            <tr>
+                              <th className="px-3 py-2">项目</th>
+                              <th className="px-3 py-2 text-right">放电量 (MWh)</th>
+                              <th className="px-3 py-2 text-right">放电收入 (万元)</th>
+                              <th className="px-3 py-2 text-right">顶峰补贴 (万元)</th>
+                              <th className="px-3 py-2 text-right">充电成本 (万元)</th>
+                              <th className="px-3 py-2 text-right">净收益 (万元)</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            <tr className="border-t border-gray-200 bg-white">
+                              <td className="px-3 py-2 text-rose-700">迎峰期 (1/6/7/12 月)</td>
+                              <td className="px-3 py-2 text-right font-mono">{monthlyRows.filter(r=>r.isSummer).reduce((s,r)=>s+r.dischargeMWh,0).toFixed(2)}</td>
+                              <td className="px-3 py-2 text-right font-mono">{toWan(monthlyRows.filter(r=>r.isSummer).reduce((s,r)=>s+r.incomeDischarge,0))}</td>
+                              <td className="px-3 py-2 text-right font-mono">{toWan(monthlyRows.filter(r=>r.isSummer).reduce((s,r)=>s+r.incomeSubsidy,0))}</td>
+                              <td className="px-3 py-2 text-right font-mono">{toWan(monthlyRows.filter(r=>r.isSummer).reduce((s,r)=>s+r.costCharge,0))}</td>
+                              <td className="px-3 py-2 text-right font-mono font-semibold text-rose-700">{toWan(profitSummer)}</td>
+                            </tr>
+                            <tr className="border-t border-gray-200 bg-gray-50">
+                              <td className="px-3 py-2 text-sky-700">非迎峰期</td>
+                              <td className="px-3 py-2 text-right font-mono">{monthlyRows.filter(r=>!r.isSummer).reduce((s,r)=>s+r.dischargeMWh,0).toFixed(2)}</td>
+                              <td className="px-3 py-2 text-right font-mono">{toWan(monthlyRows.filter(r=>!r.isSummer).reduce((s,r)=>s+r.incomeDischarge,0))}</td>
+                              <td className="px-3 py-2 text-right font-mono">{toWan(monthlyRows.filter(r=>!r.isSummer).reduce((s,r)=>s+r.incomeSubsidy,0))}</td>
+                              <td className="px-3 py-2 text-right font-mono">{toWan(monthlyRows.filter(r=>!r.isSummer).reduce((s,r)=>s+r.costCharge,0))}</td>
+                              <td className="px-3 py-2 text-right font-mono font-semibold text-sky-700">{toWan(profitNonSummer)}</td>
+                            </tr>
+                            <tr className="border-t border-gray-300 bg-gray-100">
+                              <td className="px-3 py-2 font-semibold text-gray-900">基准年合计</td>
+                              <td className="px-3 py-2 text-right font-mono">{dischargeMWhTotal.toFixed(2)}</td>
+                              <td className="px-3 py-2 text-right font-mono">{toWan(incomeDischargeTotal)}</td>
+                              <td className="px-3 py-2 text-right font-mono">{toWan(incomeSubsidyTotal)}</td>
+                              <td className="px-3 py-2 text-right font-mono">{toWan(costChargeTotal)}</td>
+                              <td className="px-3 py-2 text-right font-mono font-semibold text-rose-700">{toWan(totalProfit)}</td>
+                            </tr>
+                          </tbody>
+                        </table>
+                      </div>
+                      <p className="text-[11px] text-gray-500 mt-2">充电量合计 {chargeMWhTotal.toFixed(2)} MWh；放电量合计 {dischargeMWhTotal.toFixed(2)} MWh。</p>
+                    </div>
+
+                    {/* 逐年柱状图（含衰减） */}
+                    <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-100">
+                      <h3 className="text-sm font-bold text-gray-800 mb-3">逐年调峰收入（含 SOH 衰减折算）</h3>
+                      <div className="h-[220px] w-full">
+                        <ResponsiveContainer width="100%" height="100%">
+                          <BarChart data={results.yearlyData}>
+                            <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f0f0f0" />
+                            <XAxis dataKey="year" tickLine={false} axisLine={false} tick={{fontSize: 12}} />
+                            <YAxis tickLine={false} axisLine={false} tick={{fontSize: 12}} label={{ value: '万元', angle: -90, position: 'insideLeft', style: {fill: '#999'} }} />
+                            <RechartsTooltip formatter={(v: number) => formatNumber(v) + ' 万元'} />
+                            <Bar dataKey="breakdown.peak" fill="#e11d48" radius={[4,4,0,0]} name="调峰收益" />
+                          </BarChart>
+                        </ResponsiveContainer>
+                      </div>
+                    </div>
+
+                    <div className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-[11px] text-amber-800">
+                      <p className="font-semibold">勾稽关系说明</p>
+                      <p className="mt-1">调峰收益的参与容量来自「基础数据 → 装机容量 × 调峰比例 × DOD」；按月分解后年度净收益作为基准年值，逐年随全生命周期 SOH 折算并计入总收入。修改「调峰比例」会自动调整现货 / 调频比例之和（保持合计=1）。</p>
+                    </div>
+                  </div>
+                </div>
+
+                {/* 月度分解表（可编辑充电电价） */}
+                <div className="rounded-lg border border-gray-200 bg-white p-3 shadow-sm">
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-sm font-bold text-gray-800">按月分解（可编辑每月充电电价）</h3>
+                    <button onClick={exportPeakCsv} className="inline-flex items-center gap-2 rounded-md bg-rose-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-rose-500">
+                      <Download size={14} /> 导出 CSV
+                    </button>
+                  </div>
+                  <div className="mt-3 overflow-x-auto">
+                    <table className="w-full min-w-[900px] table-auto text-xs">
+                      <thead>
+                        <tr className="text-left text-gray-600 border-b border-gray-200">
+                          <th className="pr-4 pb-2">月</th>
+                          <th className="pr-4 pb-2">天数</th>
+                          <th className="pr-4 pb-2">类型</th>
+                          <th className="pr-4 pb-2">放电量 (MWh)</th>
+                          <th className="pr-4 pb-2">充电量 (MWh)</th>
+                          <th className="pr-4 pb-2">放电收入 (万元)</th>
+                          <th className="pr-4 pb-2">顶峰补贴 (万元)</th>
+                          <th className="pr-4 pb-2">充电成本 (万元)</th>
+                          <th className="pr-4 pb-2">净收益 (万元)</th>
+                          <th className="pr-4 pb-2">充电电价 (元/kWh)</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {monthlyRows.map(r => (
+                          <tr key={r.month} className="border-t border-gray-100">
+                            <td className="py-2">{r.month} 月</td>
+                            <td>{r.days}</td>
+                            <td>{r.isSummer ? <span className="text-rose-700">迎峰期</span> : <span className="text-gray-500">非迎峰期</span>}</td>
+                            <td>{r.dischargeMWh.toFixed(2)}</td>
+                            <td>{r.chargeMWh.toFixed(2)}</td>
+                            <td className="text-sky-700">{toWan(r.incomeDischarge)}</td>
+                            <td className="text-emerald-700">{toWan(r.incomeSubsidy)}</td>
+                            <td className="text-rose-600">{toWan(r.costCharge)}</td>
+                            <td className="font-semibold text-emerald-600">{toWan(r.profit)}</td>
+                            <td>
+                              <input
+                                type="number"
+                                value={r.chargePrice}
+                                step={0.0001}
+                                min={0}
+                                onChange={e => handleMonthChargeChange(r.month, Number(e.target.value))}
+                                className="w-24 rounded-md border border-gray-300 bg-white px-2 py-0.5 text-xs text-gray-900 outline-none focus:border-rose-500 focus:ring-1 focus:ring-rose-200"
+                              />
+                            </td>
+                          </tr>
+                        ))}
+                        <tr className="border-t border-gray-300 bg-gray-50">
+                          <td className="py-2 font-semibold" colSpan={3}>合计</td>
+                          <td className="font-mono">{dischargeMWhTotal.toFixed(2)}</td>
+                          <td className="font-mono">{chargeMWhTotal.toFixed(2)}</td>
+                          <td className="font-mono text-sky-700">{toWan(incomeDischargeTotal)}</td>
+                          <td className="font-mono text-emerald-700">{toWan(incomeSubsidyTotal)}</td>
+                          <td className="font-mono text-rose-600">{toWan(costChargeTotal)}</td>
+                          <td className="font-mono font-semibold text-emerald-700">{toWan(totalProfit)}</td>
+                          <td className="text-gray-400">—</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
               </div>
               );
             })()}
@@ -2789,13 +3148,13 @@ export default function ShandongStorageCalculator() {
                                 <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-400 shadow-[0_0_10px_rgba(16,185,129,0.9)]"></span>
                               </span>
                               <span className="uppercase text-[10px] tracking-[0.22em] text-emerald-300/90">CRITICAL</span>
-                              <span className="text-emerald-50">功率分配（现货 vs 调频）</span>
+                              <span className="text-emerald-50">功率分配（现货 vs 调频 vs 调峰）</span>
                             </p>
-                            <p className={`text-[11px] font-mono px-2 py-0.5 rounded-full border ${Math.abs(params.spotRatio + params.frRatio - 1) < 0.001 ? 'text-emerald-200 border-emerald-300/60 bg-emerald-500/15' : 'text-rose-200 border-rose-300/60 bg-rose-500/15'}`}>
-                              合计 {((params.spotRatio + params.frRatio) * 100).toFixed(1)}%
+                            <p className={`text-[11px] font-mono px-2 py-0.5 rounded-full border ${Math.abs(params.spotRatio + params.frRatio + params.peakRatio - 1) < 0.001 ? 'text-emerald-200 border-emerald-300/60 bg-emerald-500/15' : 'text-rose-200 border-rose-300/60 bg-rose-500/15'}`}>
+                              合计 {((params.spotRatio + params.frRatio + params.peakRatio) * 100).toFixed(1)}%
                             </p>
                           </div>
-                          <div className="grid grid-cols-2 gap-3 [&_label]:!text-emerald-100 [&_input]:!bg-emerald-950/40 [&_input]:!border-emerald-400/30 [&_input]:!text-emerald-50">
+                          <div className="grid grid-cols-3 gap-3 [&_label]:!text-emerald-100 [&_input]:!bg-emerald-950/40 [&_input]:!border-emerald-400/30 [&_input]:!text-emerald-50">
                             <InputField
                               label="参与现货比例"
                               unit="0~1"
@@ -2803,9 +3162,11 @@ export default function ShandongStorageCalculator() {
                               value={params.spotRatio}
                               onChange={(v:number)=>{
                                 const sv = Math.max(0, Math.min(1, Number.isFinite(v) ? v : 0));
-                                setParams({...params, spotRatio: sv, frRatio: +(1 - sv).toFixed(4)});
+                                // 保留 调峰比例 不变，自动用调频比例补足到 1
+                                const fr = Math.max(0, +(1 - sv - params.peakRatio).toFixed(4));
+                                setParams({...params, spotRatio: sv, frRatio: fr});
                               }}
-                              tooltip="参与现货市场的功率占比；与调频比例自动互补 (合计=1)"
+                              tooltip="参与现货市场的功率占比；调整后自动用调频比例补足合计=1（保留调峰比例不变）"
                             />
                             <InputField
                               label="参与调频比例"
@@ -2814,13 +3175,38 @@ export default function ShandongStorageCalculator() {
                               value={params.frRatio}
                               onChange={(v:number)=>{
                                 const fv = Math.max(0, Math.min(1, Number.isFinite(v) ? v : 0));
-                                setParams({...params, frRatio: fv, spotRatio: +(1 - fv).toFixed(4)});
+                                // 保留 调峰比例 不变，自动用现货比例补足到 1
+                                const sp = Math.max(0, +(1 - fv - params.peakRatio).toFixed(4));
+                                setParams({...params, frRatio: fv, spotRatio: sp});
                               }}
-                              tooltip="参与调频(辅助服务)的功率占比；与现货比例自动互补 (合计=1)"
+                              tooltip="参与调频(辅助服务)的功率占比；调整后自动用现货比例补足合计=1（保留调峰比例不变）"
+                            />
+                            <InputField
+                              label="参与调峰比例"
+                              unit="0~1"
+                              step={0.05}
+                              value={params.peakRatio}
+                              onChange={(v:number)=>{
+                                const pv = Math.max(0, Math.min(1, Number.isFinite(v) ? v : 0));
+                                // 调整调峰比例：在保持现货:调频原比例下，由二者合计补足到 (1 - 调峰)
+                                const remain = Math.max(0, +(1 - pv).toFixed(4));
+                                const oldSum = params.spotRatio + params.frRatio;
+                                let newSpot: number;
+                                let newFr: number;
+                                if (oldSum > 0) {
+                                  newSpot = +(remain * (params.spotRatio / oldSum)).toFixed(4);
+                                  newFr = +(remain - newSpot).toFixed(4);
+                                } else {
+                                  newSpot = remain;
+                                  newFr = 0;
+                                }
+                                setParams({...params, peakRatio: pv, spotRatio: newSpot, frRatio: newFr});
+                              }}
+                              tooltip="参与调峰（迎峰期顶峰补贴）的功率占比；调整后按现货:调频原比例自动重分配剩余 (1 - 调峰)"
                             />
                           </div>
                           <p className="text-[11px] text-emerald-200/90 mt-1">
-                            现货板块按 装机功率×现货比例 计算放电量；调频板块按 装机功率×调频比例 作为中标容量。
+                            现货板块按 装机功率×现货比例 计算放电量；调频板块按 装机功率×调频比例 作为中标容量；调峰板块按 装机容量×调峰比例 计入江苏迎峰期月度收益。
                         </p>
                         </div>
                       </div>
